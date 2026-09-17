@@ -48,11 +48,8 @@ def _long_ws(tab_name):
 
 def _find_row_by_email(ws, email):
     """1-indexed row number for this email in column A, or None."""
-    try:
-        cell = ws.find(email, in_column=1)
-        return cell.row
-    except gspread.exceptions.CellNotFound:
-        return None
+    cell = ws.find(email, in_column=1)
+    return cell.row if cell else None
 
 
 def save_snapshot(tab_name, model, email, started_at, answers, leak_order,
