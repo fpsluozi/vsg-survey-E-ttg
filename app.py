@@ -211,6 +211,10 @@ st.markdown(
     f'Intention: We want to realistically illustrate a special kind of {item["A"]}, '
     f'which bears some resemblance to {item["B"]}.'
 )
+st.markdown(
+    "Caveat: Each picture mixes two things in an imaginative way. It doesn't have to "
+    "look real. It just needs to show the mix clearly."
+)
 
 st.divider()
 
