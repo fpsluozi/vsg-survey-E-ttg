@@ -1,23 +1,24 @@
 """VSG Human Survey E — ttg model, 26 images (13 prompts x base/Gemma4 condition).
 
 Run:  streamlit run app.py            (then open http://localhost:8501)
+
+Responses are persisted to a shared Google Sheet (see sheets_store.py), not
+local disk — Streamlit Community Cloud's filesystem is ephemeral and wipes
+local files on every reboot/redeploy.
 """
-import csv
-import json
 import random
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 
 import streamlit as st
 
+import sheets_store as store
 from items import load_items, N_ITEMS
 
 SPLIT_LABEL = "E"
+MODEL = "ttg"
+SHEET_TAB = f"{SPLIT_LABEL}_{MODEL}"
 TITLE = f"VSG Human Survey {SPLIT_LABEL}"
-
-OUT_DIR = Path(__file__).resolve().parent / "responses"
-OUT_DIR.mkdir(exist_ok=True)
 
 SCALE = [1, 2, 3, 4, 5]
 QKEYS = ["q1", "q2", "q3", "q4"]
@@ -30,57 +31,25 @@ def slug(email):
     return re.sub(r"[^a-zA-Z0-9._-]", "_", email.strip().lower()) or "anonymous"
 
 
-def save_path(email):
-    return OUT_DIR / f"{slug(email)}.json"
-
-
 def save_progress():
-    """Atomic snapshot of everything answered so far. Called on every answer."""
+    """Upsert this rater's full progress to the shared sheet. Called on every answer."""
     email = st.session_state.email
     if not email:
         return
-    payload = {
-        "email": email,
-        "split": SPLIT_LABEL,
-        "started_at": st.session_state.started_at,
-        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "n_items": N_ITEMS,
-        "answers": st.session_state.answers,
-        "leak_order": st.session_state.leak_order,
-        "submitted": st.session_state.submitted,
-    }
-    p = save_path(email)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(p)
+    store.save_snapshot(
+        SHEET_TAB, MODEL, email, st.session_state.started_at,
+        st.session_state.answers, st.session_state.leak_order,
+        st.session_state.submitted, N_ITEMS,
+    )
 
 
 def load_progress(email):
-    p = save_path(email)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except json.JSONDecodeError:
-        return None
+    return store.load_snapshot(SHEET_TAB, email)
 
 
-def write_csv(email, items):
-    """Long-format CSV: one row per (image, question)."""
-    path = OUT_DIR / f"{slug(email)}.csv"
-    with path.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["email", "split", "idx", "prompt_id", "condition", "relation",
-                    "prompt", "image", "question_id", "question_text", "rating"])
-        for it in items:
-            a = st.session_state.answers.get(str(it["idx"]), {})
-            for q in QKEYS:
-                qtext = {"q1": it["q1"], "q2": it["q2"], "q3": it["q3"],
-                          "q4": q4_text(it)}[q]
-                w.writerow([email, SPLIT_LABEL, it["idx"], it["prompt_id"],
-                            it["condition"], it["relation"], it["prompt"],
-                            it["image"].name, q, qtext, a.get(q, "")])
-    return path
+def submit_responses(email, items):
+    """Expand this rater's answers into the long-format tab at final submit."""
+    store.write_long_rows(SHEET_TAB, MODEL, email, items, st.session_state.answers, q4_text)
 
 
 # --------------------------------------------------------------- session state
@@ -170,11 +139,7 @@ if st.session_state.page == "welcome":
 if st.session_state.page == "done":
     st.title("Thank you — responses recorded")
     st.success(f"All {N_ITEMS} images annotated by **{st.session_state.email}**.")
-    csv_path = OUT_DIR / f"{slug(st.session_state.email)}.csv"
-    st.markdown(f"Saved to `{csv_path}` and `{save_path(st.session_state.email)}`.")
-    if csv_path.exists():
-        st.download_button("Download my responses (CSV)", csv_path.read_bytes(),
-                           file_name=csv_path.name, mime="text/csv")
+    st.markdown("Your responses have been saved to the shared results sheet.")
     if st.button("Back to the images"):
         st.session_state.page = "survey"
         st.rerun()
@@ -275,7 +240,7 @@ with c3:
     if st.button(f"Submit all {N_ITEMS}", disabled=bool(missing), width="stretch"):
         st.session_state.submitted = True
         save_progress()
-        write_csv(st.session_state.email, ITEMS)
+        submit_responses(st.session_state.email, ITEMS)
         st.session_state.page = "done"
         st.rerun()
 

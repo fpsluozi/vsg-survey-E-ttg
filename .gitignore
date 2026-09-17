@@ -1,4 +1,3 @@
 __pycache__/
 *.pyc
-responses/*.json
-responses/*.csv
+.streamlit/secrets.toml

@@ -1,81 +1,88 @@
-"""Merge every annotator's autosave into one long-format CSV + a per-item summary.
+"""Pull this split's long-format responses from the shared Google Sheet and
+write a local per-item summary CSV.
 
-    python collect.py            -> responses/ALL_responses.csv, responses/ALL_summary.csv
+Requires a local .streamlit/secrets.toml with [gcp_service_account] and
+sheet_id (the same secrets used by the deployed app) or the
+GOOGLE_APPLICATION_CREDENTIALS + SHEET_ID environment variables.
+
+    python collect.py            -> ALL_summary.csv
 """
 import csv
-import json
+import os
 import statistics
+import tomllib
 from pathlib import Path
 
-from items import load_items, N_ITEMS
+import gspread
+from google.oauth2.service_account import Credentials
 
 HERE = Path(__file__).resolve().parent
-OUT = HERE / "responses"
-QKEYS = ["q1", "q2", "q3", "q4"]
+SPLIT_LABEL = "E"
+MODEL = "ttg"
+SHEET_TAB = f"{SPLIT_LABEL}_{MODEL}"
+
+_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 
-def leak_text(item, order):
-    attrs = item["leak_attributes"]
-    if order:
-        attrs = [attrs[i] for i in order]
-    lead_in = item["q4"].split(":", 1)[0]
-    return f"{lead_in}: {'; '.join(attrs)}."
+def _client_and_sheet_id():
+    secrets_path = HERE / ".streamlit" / "secrets.toml"
+    if secrets_path.exists():
+        with secrets_path.open("rb") as f:
+            secrets = tomllib.load(f)
+        creds = Credentials.from_service_account_info(
+            secrets["gcp_service_account"], scopes=_SCOPES
+        )
+        sheet_id = secrets["sheet_id"]
+    else:
+        key_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+        creds = Credentials.from_service_account_file(key_path, scopes=_SCOPES)
+        sheet_id = os.environ["SHEET_ID"]
+    return gspread.authorize(creds), sheet_id
 
 
 def main():
-    items = {it["idx"]: it for it in load_items()}
-    files = sorted(p for p in OUT.glob("*.json") if not p.name.startswith("ALL_"))
-    if not files:
-        print(f"No responses yet in {OUT}")
+    gc, sheet_id = _client_and_sheet_id()
+    sh = gc.open_by_key(sheet_id)
+    ws = sh.worksheet(f"{SHEET_TAB}_long")
+    records = ws.get_all_records()
+    if not records:
+        print(f"No responses yet in tab {SHEET_TAB}_long")
         return
 
-    rows = []
-    per_q = {}          # (idx, qk) -> [ratings]
-    for p in files:
-        d = json.loads(p.read_text())
-        email = d.get("email", p.stem)
-        leak_order = d.get("leak_order", {})
-        complete = sum(1 for v in d.get("answers", {}).values()
-                       if all(v.get(q) for q in QKEYS))
-        print(f"{email:<40} {complete:>3}/{N_ITEMS} complete"
-              f"{'  [submitted]' if d.get('submitted') else ''}")
-        for k, a in d.get("answers", {}).items():
-            idx = int(k)
-            it = items.get(idx)
-            if it is None:
-                continue
-            qtext = {
-                "q1": it["q1"], "q2": it["q2"], "q3": it["q3"],
-                "q4": leak_text(it, leak_order.get(k)),
-            }
-            for q in QKEYS:
-                if not a.get(q):
-                    continue
-                rows.append([email, d.get("submitted", False), idx, it["prompt_id"],
-                             it["condition"], it["relation"], it["prompt"],
-                             it["image"].name, q, qtext[q], a[q]])
-                per_q.setdefault((idx, q), []).append(a[q])
-
-    all_csv = OUT / "ALL_responses.csv"
+    all_csv = HERE / "ALL_responses.csv"
     with all_csv.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["email", "submitted", "idx", "prompt_id", "condition", "relation",
-                    "prompt", "image", "question_id", "question_text", "rating"])
-        w.writerows(sorted(rows, key=lambda r: (r[2], r[8], r[0])))
+        w.writerow(list(records[0].keys()))
+        for r in records:
+            w.writerow(list(r.values()))
 
-    sum_csv = OUT / "ALL_summary.csv"
+    per_q = {}   # (idx, question_id) -> [ratings]
+    meta = {}    # (idx, question_id) -> (prompt_id, condition, relation)
+    for r in records:
+        rating = r.get("rating")
+        if rating in (None, ""):
+            continue
+        key = (r["idx"], r["question_id"])
+        per_q.setdefault(key, []).append(float(rating))
+        meta[key] = (r["prompt_id"], r["condition"], r["relation"])
+
+    sum_csv = HERE / "ALL_summary.csv"
     with sum_csv.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["idx", "prompt_id", "condition", "relation", "question_id",
                     "n", "mean", "median", "stdev"])
         for (idx, q), vals in sorted(per_q.items()):
-            it = items[idx]
-            w.writerow([idx, it["prompt_id"], it["condition"], it["relation"], q,
+            prompt_id, condition, relation = meta[(idx, q)]
+            w.writerow([idx, prompt_id, condition, relation, q,
                         len(vals), round(statistics.mean(vals), 3),
                         statistics.median(vals),
                         round(statistics.stdev(vals), 3) if len(vals) > 1 else ""])
 
-    print(f"\n{len(rows)} ratings from {len(files)} annotator(s)")
+    emails = sorted({r["email"] for r in records if r.get("email")})
+    print(f"{len(records)} response rows from {len(emails)} rater(s): {', '.join(emails)}")
     print(f"  {all_csv}")
     print(f"  {sum_csv}")
 
